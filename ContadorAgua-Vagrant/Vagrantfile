@@ -1,0 +1,97 @@
+Vagrant.configure("2") do |config|
+  maquinas = {
+    "servidor" => "192.168.33.10",
+    "contador"  => "192.168.33.11"
+  }
+
+  maquinas.each do |nombre, ip|
+    config.vm.define nombre do |vm|
+      vm.vm.box = "ubuntu/focal64"
+      vm.vm.network "private_network", ip: ip
+      vm.vm.provider "virtualbox" do |vb|
+        vb.memory = (nombre == "servidor" ? "4096" : "2048") # Más memoria al servidor
+        vb.cpus = (nombre == "servidor" ? 2 : 1)             # Más CPU al servidor
+      end
+
+      config.vm.provision "file", source: "#{Dir.home}/.ssh/vagrant_vm_key.pub", destination: "/home/vagrant/.ssh/authorized_keys"
+
+      config.vm.provision "shell", run: "once" do |s|
+        s.inline = <<-SHELL
+          sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+    
+          # Ajustar permisos
+          chmod 700 /home/vagrant/.ssh
+          chmod 600 /home/vagrant/.ssh/authorized_keys
+          chown -R vagrant:vagrant /home/vagrant/.ssh
+    
+          # Reiniciar el servidor SSH
+          systemctl restart sshd
+        SHELL
+      end
+
+      if nombre == "servidor"
+        # Instalación y configuración de PostgreSQL en el servidor
+        vm.vm.provision "shell", run: "once" do |s|
+          s.inline = <<-SHELL
+            apt-get update
+            apt-get install -y postgresql postgresql-contrib libpq-dev python3 python3-pip
+            pip3 install flask psycopg2-binary
+
+            # Configuración de PostgreSQL
+            sudo -u postgres psql -c "CREATE DATABASE agua;"
+            sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'vagrant';"
+
+            # Permitir conexiones externas
+            echo "listen_addresses = '*'" | sudo tee -a /etc/postgresql/10/main/postgresql.conf
+            echo "host all all 0.0.0.0/0 md5" | sudo tee -a /etc/postgresql/10/main/pg_hba.conf
+
+            # Reiniciamos PostgreSQL
+            systemctl restart postgresql      
+            # Ejecutar el servidor Flask en segundo plano
+            nohup python3 /home/vagrant/servidor.py > /home/vagrant/flask.log 2>&1 & 
+            # Copiar servidor.py a la máquina servidor
+            vm.vm.provision "file", source: "servidor.py", destination: "/home/vagrant/servidor.py"
+          SHELL
+        end
+
+      elsif nombre == "contador"
+        # Instalación de dependencias, configuración de zona horaria y CRON en una sola provisión
+        vm.vm.provision "shell", run: "once" do |s|
+          s.inline = <<-SHELL
+            # Instalar Python y dependencias
+            apt-get update
+            apt-get install -y python3 python3-pip
+            pip3 install requests numpy
+            
+            # Configurar zona horaria a Europe/Madrid
+            sudo timedatectl set-timezone Europe/Madrid
+        
+            # Copiar contador.py si aún no existe
+            if [ ! -f /home/vagrant/contador.py ]; then
+              cp /vagrant/contador.py /home/vagrant/contador.py
+            fi
+        
+            # Asegurar que el script tiene permisos de ejecución
+            chmod +x /home/vagrant/contador.py
+        
+            # Instalar y activar cron
+            apt-get install -y cron
+            sudo systemctl restart cron
+            sudo systemctl enable cron
+      
+            # Asegurar que el usuario vagrant tenga permisos en cron
+            echo "vagrant" | sudo tee -a /etc/cron.allow
+            sudo sed -i '/vagrant/d' /etc/cron.deny 2>/dev/null || true
+      
+            # Configurar CRON para ejecutar el script cada día a las 13:00 a 13.24
+            (crontab -l 2>/dev/null | grep -v "contador.py" | grep -v '^$' ; echo "0-24 13 * * * /usr/bin/python3 /home/vagrant/contador.py >> /home/vagrant/contador.log 2>&1") | crontab -
+          SHELL
+        end        
+      end
+
+      config.ssh.insert_key = false
+      config.ssh.extra_args = ["-o StrictHostKeyChecking=no", "-o UserKnownHostsFile=/dev/null"]
+    end
+  end
+end
